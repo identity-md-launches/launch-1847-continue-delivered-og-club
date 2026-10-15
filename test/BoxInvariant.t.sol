@@ -20,6 +20,13 @@ contract BoxHandler is Test, ERC1155Holder {
     uint256 public itemsOpened;
     uint256 public previewChecks;
     uint256 public replayChecks;
+    uint256 public deliveryReplayChecks;
+    uint256 public deliveryFailures;
+    uint256 public itemsDelivered;
+    bool public rejectDelivery;
+    address public redirectedRecipient = makeAddr("delivery recipient");
+    mapping(uint256 => uint256) public deliveryCount;
+    mapping(uint256 => bytes32) public recordedRoll;
     mapping(uint256 => uint256) public openCount;
     mapping(uint256 => bool) internal hasRandao;
     mapping(uint256 => bytes32) internal randaoByBlock;
@@ -78,12 +85,25 @@ contract BoxHandler is Test, ERC1155Holder {
             beforeBalances[i] = furniture.balanceOf(buyer, i + 1);
         }
         box.open(id, header);
+        recordedRoll[id] = keccak256(abi.encode(preview));
+        if (box.delivered(id)) {
+            ++deliveryCount[id];
+            itemsDelivered += count;
+            assertEq(box.getStoredItems(id).length, 0);
+        } else {
+            ++deliveryFailures;
+            assertEq(box.getStoredItems(id), preview);
+        }
         for (uint256 i; i < 3; ++i) {
             uint256 expected;
             for (uint256 j; j < preview.length; ++j) {
                 if (preview[j] == i + 1) ++expected;
             }
-            assertEq(furniture.balanceOf(buyer, i + 1), beforeBalances[i] + expected, "preview/open disagreement");
+            assertEq(
+                furniture.balanceOf(buyer, i + 1),
+                beforeBalances[i] + (box.delivered(id) ? expected : 0),
+                "preview/open disagreement"
+            );
         }
         ++previewChecks;
         ++openCount[id];
@@ -91,6 +111,72 @@ contract BoxHandler is Test, ERC1155Holder {
         assertEq(preview.length, count);
         assertLe(box.minted(season, 2), 4);
         assertLe(box.minted(season, 3), 3);
+    }
+
+    function setRejectDelivery(bool value) external {
+        rejectDelivery = value;
+    }
+
+    function retryDelivery(uint256 selector, bool redirect) external {
+        if (box.purchaseCount() == 0) return;
+        uint256 id = selector % box.purchaseCount() + 1;
+        (,, uint256 count,, bool opened) = box.purchases(id);
+        bool wasDelivered = box.delivered(id);
+        uint256[] memory stored = box.getStoredItems(id);
+        address to = redirect ? redirectedRecipient : address(this);
+        uint256[3] memory balances;
+        for (uint256 item = 1; item <= 3; ++item) {
+            balances[item - 1] = furniture.balanceOf(to, item);
+        }
+        bytes memory call_ = redirect ? abi.encodeCall(box.deliverTo, (id, to)) : abi.encodeCall(box.deliver, (id));
+        // Permissionless deliver is exercised by a third party; deliverTo must come from the buyer.
+        if (!redirect) vm.prank(makeAddr("delivery relayer"));
+        (bool ok, bytes memory reason) = address(box).call(call_);
+        if (!opened) {
+            assertFalse(ok);
+            assertEq(reason, abi.encodeWithSelector(OGClubBox.NotOpened.selector, id));
+        } else if (wasDelivered) {
+            assertFalse(ok);
+            assertEq(reason, abi.encodeWithSelector(OGClubBox.AlreadyDelivered.selector, id));
+            ++deliveryReplayChecks;
+        } else if (rejectDelivery && !redirect) {
+            assertFalse(ok);
+            assertFalse(box.delivered(id));
+            assertEq(box.getStoredItems(id), stored);
+            ++deliveryFailures;
+        } else {
+            assertTrue(ok);
+            assertEq(stored.length, count);
+            assertEq(keccak256(abi.encode(stored)), recordedRoll[id]);
+            assertTrue(box.delivered(id));
+            assertEq(box.getStoredItems(id).length, 0);
+            ++deliveryCount[id];
+            itemsDelivered += count;
+        }
+        for (uint256 item = 1; item <= 3; ++item) {
+            uint256 received;
+            if (ok) {
+                for (uint256 i; i < stored.length; ++i) {
+                    if (stored[i] == item) ++received;
+                }
+            }
+            assertEq(furniture.balanceOf(to, item), balances[item - 1] + received);
+        }
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes memory) public view override returns (bytes4) {
+        require(!rejectDelivery, "receiver rejects");
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] memory, uint256[] memory, bytes memory)
+        public
+        view
+        override
+        returns (bytes4)
+    {
+        require(!rejectDelivery, "receiver rejects");
+        return this.onERC1155BatchReceived.selector;
     }
 }
 
@@ -106,11 +192,21 @@ contract BoxInvariantTest is BoxTestBase {
         handler.purchase(10, 0);
         handler.reveal(0, keccak256("initial invariant reveal"));
         handler.reveal(0, bytes32(0));
-        bytes4[] memory selectors = new bytes4[](4);
+        handler.retryDelivery(0, false); // Already delivered: replay must fail.
+        handler.setRejectDelivery(true);
+        handler.purchase(10, 1);
+        handler.reveal(1, keccak256("stored invariant reveal"));
+        handler.retryDelivery(1, false); // Receiver still rejects; storage must survive.
+        handler.purchase(10, 0);
+        handler.reveal(2, keccak256("redirected invariant reveal"));
+        handler.retryDelivery(2, true); // Successful redirect, leaving purchase 2 stored.
+        bytes4[] memory selectors = new bytes4[](6);
         selectors[0] = BoxHandler.purchase.selector;
         selectors[1] = BoxHandler.advance.selector;
         selectors[2] = BoxHandler.pause.selector;
         selectors[3] = BoxHandler.reveal.selector;
+        selectors[4] = BoxHandler.setRejectDelivery.selector;
+        selectors[5] = BoxHandler.retryDelivery.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
@@ -122,8 +218,21 @@ contract BoxInvariantTest is BoxTestBase {
         assertEq(token.balanceOf(address(handler)), 1_000_000 ether - handler.paid());
     }
 
-    function invariant_CapsAndSupplyMatchPerSeasonMints() public view {
+    function invariant_CapsAndDeliveredSupplyPlusStoredItemsMatchPerSeasonMints() public view {
         uint256 total;
+        uint256 storedTotal;
+        uint256[4] memory storedPerItem;
+        for (uint256 purchase = 1; purchase <= box.purchaseCount(); ++purchase) {
+            uint256[] memory stored = box.getStoredItems(purchase);
+            if (stored.length != 0) {
+                assertFalse(box.delivered(purchase));
+                assertEq(keccak256(abi.encode(stored)), handler.recordedRoll(purchase));
+            }
+            for (uint256 i; i < stored.length; ++i) {
+                ++storedPerItem[stored[i]];
+            }
+            storedTotal += stored.length;
+        }
         for (uint256 id = 1; id <= 3; ++id) {
             uint256 combined;
             for (uint256 season = 1; season <= 2; ++season) {
@@ -132,12 +241,16 @@ contract BoxInvariantTest is BoxTestBase {
                 if (id == 3) assertLe(minted, 3);
                 combined += minted;
             }
-            assertEq(combined, furniture.totalSupply(id));
-            assertEq(combined, furniture.balanceOf(address(handler), id));
+            assertEq(combined, furniture.totalSupply(id) + storedPerItem[id]);
+            assertEq(
+                furniture.totalSupply(id),
+                furniture.balanceOf(address(handler), id) + furniture.balanceOf(handler.redirectedRecipient(), id)
+            );
             total += combined;
         }
         assertEq(total, handler.itemsOpened());
-        assertEq(total, furniture.totalSupply());
+        assertEq(total, furniture.totalSupply() + storedTotal);
+        assertEq(furniture.totalSupply(), handler.itemsDelivered());
     }
 
     function invariant_EachPurchaseOpenedOnceAndEveryOpenMatchedPreview() public view {
@@ -146,6 +259,10 @@ contract BoxInvariantTest is BoxTestBase {
         for (uint256 id = 1; id <= box.purchaseCount(); ++id) {
             (,, uint256 count,, bool opened) = box.purchases(id);
             assertEq(handler.openCount(id), opened ? 1 : 0);
+            bool delivered = box.delivered(id);
+            assertEq(handler.deliveryCount(id), delivered ? 1 : 0);
+            if (delivered) assertTrue(opened);
+            assertEq(box.getStoredItems(id).length, opened && !delivered ? count : 0);
             if (opened) {
                 ++openPurchases;
                 openItems += count;
@@ -155,5 +272,7 @@ contract BoxInvariantTest is BoxTestBase {
         assertEq(openItems, handler.itemsOpened());
         assertGt(handler.previewChecks(), 0);
         assertGt(handler.replayChecks(), 0);
+        assertGt(handler.deliveryReplayChecks(), 0);
+        assertGt(handler.deliveryFailures(), 0);
     }
 }

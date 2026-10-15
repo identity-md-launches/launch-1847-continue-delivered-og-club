@@ -15,6 +15,10 @@ contract HeaderHarness2 {
 
 /// @dev A buyer that is a contract without any ERC-1155 receiver hook.
 contract DeafBuyer {
+    function deliverTo(OGClubBox box, uint256 purchaseId, address to) external {
+        box.deliverTo(purchaseId, to);
+    }
+
     function buy(OGClubBox box, uint256 season, uint256 count) external returns (uint256) {
         return box.buy(season, count);
     }
@@ -258,30 +262,58 @@ contract EdgeCasesTest is BoxTestBase {
         assertEq(token.balanceOf(box.BURN_ADDRESS()), 0);
     }
 
-    function test_ContractBuyerWithoutReceiverCannotBeOpenedButStateIsUntouched() public {
+    function test_ContractBuyerWithoutReceiverOpensAndCanRedirectDelivery() public {
         DeafBuyer deaf = new DeafBuyer();
         token.mint(address(deaf), 1000);
         vm.prank(address(deaf));
         token.approve(address(box), type(uint256).max);
         uint256 purchase = deaf.buy(box, seasonId, 3);
+        assertEq(token.balanceOf(address(deaf)), 1000 - 303);
         bytes32 randao = keccak256("deaf");
         bytes memory header = ready(purchase, randao);
         uint256[] memory expected = box.previewOpen(purchase, randao);
-        vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidReceiver.selector, address(deaf)));
+        vm.expectEmit(true, false, false, true, address(box));
+        emit DeliveryFailed(purchase);
         box.open(purchase, header);
         (,,,, bool opened) = box.purchases(purchase);
-        assertFalse(opened);
+        assertTrue(opened);
+        assertFalse(box.delivered(purchase));
         assertEq(furniture.totalSupply(), 0);
-        for (uint256 i = 1; i <= 3; ++i) {
-            assertEq(box.minted(seasonId, i), 0);
+        assertEq(box.getStoredItems(purchase), expected);
+        for (uint256 i; i < 2; ++i) {
+            if (i == 1) vm.roll(target(purchase) + 300);
+            vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidReceiver.selector, address(deaf)));
+            box.deliver(purchase);
+            assertFalse(box.delivered(purchase));
+            assertEq(box.getStoredItems(purchase), expected);
         }
-        // The purchase is still pending and the preview is unchanged; items never go anywhere else.
-        assertEq(box.previewOpen(purchase, randao), expected);
-        vm.roll(target(purchase) + 300);
-        vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidReceiver.selector, address(deaf)));
-        box.open(purchase, "");
-        assertEq(furniture.balanceOf(stranger, 1), 0);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(OGClubBox.NotBuyer.selector, purchase));
+        box.deliverTo(purchase, stranger);
+        vm.expectRevert(OGClubBox.InvalidAddress.selector);
+        deaf.deliverTo(box, purchase, address(0));
+        vm.expectEmit(true, true, false, true, address(box));
+        emit Delivered(purchase, buyer);
+        deaf.deliverTo(box, purchase, buyer);
+        assertTrue(box.delivered(purchase));
+        assertEq(box.getStoredItems(purchase).length, 0);
+        assertEq(furniture.totalSupply(), 3);
+        for (uint256 id = 1; id <= 3; ++id) {
+            uint256 received;
+            for (uint256 i; i < expected.length; ++i) {
+                if (expected[i] == id) ++received;
+            }
+            assertEq(furniture.balanceOf(buyer, id), received);
+            assertEq(box.minted(seasonId, id), received);
+            assertEq(furniture.balanceOf(address(deaf), id), 0);
+        }
+        vm.expectRevert(abi.encodeWithSelector(OGClubBox.AlreadyDelivered.selector, purchase));
+        deaf.deliverTo(box, purchase, buyer);
+        assertEq(token.balanceOf(address(box)), 0);
     }
+
+    event DeliveryFailed(uint256 indexed purchaseId);
+    event Delivered(uint256 indexed purchaseId, address indexed to);
 
     function test_PurchasesInTheSameBlockShareTheTargetAndHeader() public {
         uint256 a = buy(10);

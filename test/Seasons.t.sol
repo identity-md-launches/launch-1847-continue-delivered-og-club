@@ -109,7 +109,7 @@ contract SeasonsTest is BoxTestBase {
     }
 
     function test_BuyRequiresTheBoxToBeAnAuthorizedMinter() public {
-        furniture.setMinter(address(box), false);
+        furniture.revokeMinter(address(box));
         uint256 beforeBuyer = token.balanceOf(buyer);
         vm.expectRevert(OGClubBox.BoxNotMinter.selector);
         buy(1);
@@ -117,7 +117,7 @@ contract SeasonsTest is BoxTestBase {
         assertEq(token.balanceOf(vault), 0);
         assertEq(token.balanceOf(box.BURN_ADDRESS()), 0);
         assertEq(box.purchaseCount(), 0);
-        furniture.setMinter(address(box), true);
+        furniture.grantMinter(address(box));
         buy(1);
         assertEq(box.purchaseCount(), 1);
     }

@@ -15,17 +15,23 @@ contract OGClubFurniture is ERC1155, ERC1155Supply, ERC2981, Ownable2Step {
     string public constant name = "OG Club Furniture";
     string public constant symbol = "OGFURNI";
     uint96 public constant MAX_ROYALTY_BPS = 1000;
+    uint256 public constant MINTER_DELAY = 7 days;
 
     string public baseURI;
     bool public metadataFrozen;
     mapping(address minter => bool allowed) public minters;
+    mapping(address minter => uint256 activatesAt) public pendingMinters;
 
     error ZeroAddress();
     error NotMinter(address caller);
+    error NoMinterProposal(address minter);
+    error MinterDelayNotElapsed(address minter, uint256 activatesAt);
     error MetadataFrozen();
     error RoyaltyTooHigh(uint96 bps);
 
     event MinterSet(address indexed minter, bool allowed);
+    event MinterProposed(address indexed minter, uint256 activatesAt);
+    event MinterProposalCancelled(address indexed minter);
     event BaseURISet(string baseURI);
     event MetadataPermanentlyFrozen(string baseURI);
     event RoyaltySet(address indexed receiver, uint96 bps);
@@ -38,11 +44,44 @@ contract OGClubFurniture is ERC1155, ERC1155Supply, ERC2981, Ownable2Step {
         emit RoyaltySet(royaltyReceiver, 500);
     }
 
-    /// @notice Authorize or revoke an account's ability to mint furniture.
-    function setMinter(address minter, bool allowed) external onlyOwner {
+    /// @notice Authorize immediately before the first mint, otherwise propose activation in seven days.
+    /// @dev Re-proposing restarts the delay. An existing authorization stays active until revoked.
+    function grantMinter(address minter) external onlyOwner {
         if (minter == address(0)) revert ZeroAddress();
-        minters[minter] = allowed;
-        emit MinterSet(minter, allowed);
+        if (totalSupply() == 0) {
+            delete pendingMinters[minter];
+            minters[minter] = true;
+            emit MinterSet(minter, true);
+        } else {
+            uint256 activatesAt = block.timestamp + MINTER_DELAY;
+            pendingMinters[minter] = activatesAt;
+            emit MinterProposed(minter, activatesAt);
+        }
+    }
+
+    /// @notice Anyone may activate a proposal once its delay has elapsed.
+    function activateMinter(address minter) external {
+        uint256 activatesAt = pendingMinters[minter];
+        if (activatesAt == 0) revert NoMinterProposal(minter);
+        if (block.timestamp < activatesAt) revert MinterDelayNotElapsed(minter, activatesAt);
+        delete pendingMinters[minter];
+        minters[minter] = true;
+        emit MinterSet(minter, true);
+    }
+
+    /// @notice Cancel a pending proposal without changing any existing authorization.
+    function cancelMinter(address minter) external onlyOwner {
+        if (pendingMinters[minter] == 0) revert NoMinterProposal(minter);
+        delete pendingMinters[minter];
+        emit MinterProposalCancelled(minter);
+    }
+
+    /// @notice Immediately revoke minting and discard any pending proposal.
+    function revokeMinter(address minter) external onlyOwner {
+        if (minter == address(0)) revert ZeroAddress();
+        delete pendingMinters[minter];
+        minters[minter] = false;
+        emit MinterSet(minter, false);
     }
 
     /// @notice Mint piece IDs and quantities; only an explicitly authorized minter may call.

@@ -139,6 +139,11 @@ contract OpeningTest is BoxTestBase {
             assertFalse(receiver.openSucceeded());
             assertFalse(receiver.otherOpenSucceeded());
             assertFalse(receiver.buySucceeded());
+            assertFalse(receiver.deliverSucceeded());
+            assertFalse(receiver.deliverToSucceeded());
+            assertFalse(receiver.otherDeliverSucceeded());
+            assertEq(receiver.deliverError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+            assertEq(receiver.deliverToError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
             assertEq(receiver.openError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
             assertEq(receiver.buyError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
             (,,,, bool opened) = box.purchases(receiver.otherPurchaseId());
@@ -147,7 +152,7 @@ contract OpeningTest is BoxTestBase {
         assertEq(box.purchaseCount(), 4);
     }
 
-    function test_RejectedMintRollsBackOpenedAndCapsAndCanRetry() public {
+    function test_RejectedFirstDeliveryRecordsOpenedAndCapsAndCanRetry() public {
         ReentrantBuyer receiver = new ReentrantBuyer(box, token, seasonId);
         token.mint(address(receiver), 10_000);
         uint256 purchase = receiver.buy(10);
@@ -155,30 +160,90 @@ contract OpeningTest is BoxTestBase {
         bytes memory header = ready(purchase, randao);
         receiver.configure(header, true);
         uint256[] memory preview = box.previewOpen(purchase, randao);
-        vm.expectRevert(bytes("test receiver rejects"));
         box.open(purchase, header);
         (,,,, bool opened) = box.purchases(purchase);
-        assertFalse(opened);
+        assertTrue(opened);
+        assertFalse(box.delivered(purchase));
         assertEq(furniture.totalSupply(), 0);
         for (uint256 id = 1; id <= 3; ++id) {
-            assertEq(box.minted(seasonId, id), 0);
+            uint256 expected;
+            for (uint256 i; i < preview.length; ++i) {
+                if (preview[i] == id) ++expected;
+            }
+            assertEq(box.minted(seasonId, id), expected);
         }
-        assertEq(box.previewOpen(purchase, randao), preview);
+        assertEq(box.getStoredItems(purchase), preview);
         receiver.configure(header, false);
-        assertOpenMatches(purchase, randao, header, false);
+        vm.prank(stranger);
+        box.deliver(purchase);
+        assertTrue(box.delivered(purchase));
+        assertEq(box.getStoredItems(purchase).length, 0);
+        assertEq(furniture.totalSupply(), 10);
+        assertEq(receiver.callbacks(), 1);
+        assertTrue(receiver.sawDelivered());
+        assertFalse(receiver.deliverSucceeded());
+        assertFalse(receiver.deliverToSucceeded());
+        assertFalse(receiver.otherDeliverSucceeded());
+        assertFalse(receiver.openSucceeded());
+        assertFalse(receiver.buySucceeded());
+        assertEq(receiver.deliverError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        assertEq(receiver.deliverToError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        for (uint256 id = 1; id <= 3; ++id) {
+            assertEq(furniture.balanceOf(address(receiver), id), box.minted(seasonId, id));
+        }
+        vm.expectRevert(abi.encodeWithSelector(OGClubBox.AlreadyDelivered.selector, purchase));
+        box.deliver(purchase);
     }
 
-    function test_MinterRevocationFailsAtomicallyUntilRestored() public {
+    function test_RevokedMinterRecordsRollAndDeliversAfterExpiryAndDelayedRestoration() public {
+        // Existing supply makes re-authorization subject to seven days.
+        uint256 first = buy(1);
+        box.open(first, ready(first, keccak256("first")));
         uint256 purchase = buy(10);
         bytes32 randao = keccak256("revoked");
         bytes memory header = ready(purchase, randao);
-        furniture.setMinter(address(box), false);
-        vm.expectRevert();
+        uint256[] memory expected = box.previewOpen(purchase, randao);
+        uint256[] memory balancesBefore = new uint256[](4);
+        bool nonFallback;
+        for (uint256 id = 1; id <= 3; ++id) {
+            balancesBefore[id] = furniture.balanceOf(buyer, id);
+        }
+        for (uint256 i; i < expected.length; ++i) {
+            if (expected[i] != 1) nonFallback = true;
+        }
+        assertTrue(nonFallback);
+        furniture.revokeMinter(address(box));
+        vm.recordLogs();
         box.open(purchase, header);
+        checkOpenLogs(purchase, expected, randao, false);
         (,,,, bool opened) = box.purchases(purchase);
-        assertFalse(opened);
-        assertEq(furniture.totalSupply(), 0);
-        furniture.setMinter(address(box), true);
-        assertOpenMatches(purchase, randao, header, false);
+        assertTrue(opened);
+        assertFalse(box.delivered(purchase));
+        assertEq(box.getStoredItems(purchase), expected);
+        assertEq(furniture.totalSupply(), 1);
+        vm.roll(target(purchase) + 300);
+        furniture.grantMinter(address(box));
+        assertFalse(furniture.minters(address(box)));
+        vm.expectRevert();
+        box.deliver(purchase);
+        assertFalse(box.delivered(purchase));
+        assertEq(box.getStoredItems(purchase), expected);
+        vm.warp(furniture.pendingMinters(address(box)));
+        vm.prank(stranger);
+        furniture.activateMinter(address(box));
+        box.setPaused(true);
+        box.closeSeason(seasonId);
+        vm.prank(stranger);
+        box.deliver(purchase);
+        assertTrue(box.delivered(purchase));
+        for (uint256 id = 1; id <= 3; ++id) {
+            uint256 received;
+            for (uint256 i; i < expected.length; ++i) {
+                if (expected[i] == id) ++received;
+            }
+            assertEq(furniture.balanceOf(buyer, id), balancesBefore[id] + received);
+        }
+        assertEq(furniture.totalSupply(), 11);
+        assertEq(token.balanceOf(address(box)), 0);
     }
 }

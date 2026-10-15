@@ -112,21 +112,22 @@ contract FixedOddsTest is BoxTestBase {
         bytes memory header = ready(pReceiver, randao);
         assertEq(box.previewOpen(pReceiver, randao)[0], COMMON);
 
-        // The contract buyer vetoes a forced delivery of its Common roll.
+        // The contract buyer rejects delivery, but cannot veto recording its Common roll.
         receiver.configure(header, true);
         vm.prank(stranger);
-        vm.expectRevert(bytes("test receiver rejects"));
         box.open(pReceiver, header);
         (,,,, bool opened) = box.purchases(pReceiver);
-        assertFalse(opened);
+        assertTrue(opened);
+        assertFalse(box.delivered(pReceiver));
 
-        // The Bait sells out while the buyer holds out; its retry still yields the same Common.
+        // The Bait sells out while delivery is pending; the stored Common does not change.
         vm.prank(address(receiver));
         box.open(pDave, header);
         assertEq(box.minted(seasonId, BAIT), 1);
-        assertEq(box.previewOpen(pReceiver, randao)[0], COMMON, "holding out must not earn a re-roll");
+        assertEq(box.getStoredItems(pReceiver)[0], COMMON, "holding out must not earn a re-roll");
         receiver.configure(header, false);
-        assertOpenMatches(pReceiver, randao, header, false);
+        box.deliver(pReceiver);
+        assertTrue(box.delivered(pReceiver));
         assertEq(furniture.balanceOf(address(receiver), COMMON), 1);
     }
 
@@ -172,6 +173,48 @@ contract FixedOddsTest is BoxTestBase {
         assertOpenMatches(pack, randao, header, false);
         assertEq(box.minted(seasonId, 2), 1);
         assertEq(furniture.balanceOf(alice, 2), 0);
+    }
+
+    function test_RejectedTenPackReservesRareAndCannotUpgradeAfterAnotherOpen() public {
+        OGClubBox.Entry[] memory entries = new OGClubBox.Entry[](4);
+        entries[0] = OGClubBox.Entry(1, 0, 100, 0);
+        entries[1] = OGClubBox.Entry(2, 2, 50, 1);
+        entries[2] = OGClubBox.Entry(3, 3, 25, 0);
+        entries[3] = OGClubBox.Entry(4, 4, 25, 0);
+        seasonId = box.createSeason(100, 1000, 100_000, 0, 1, entries);
+        ReentrantBuyer receiver = new ReentrantBuyer(box, token, seasonId);
+        token.mint(address(receiver), 10_000);
+        uint256 pack = receiver.buy(10);
+        uint256 single = buyAs(bob, 1);
+        bytes32 randao = findPackRandao(pack, single);
+        bytes memory header = ready(pack, randao);
+        uint256[] memory expected = box.previewOpen(pack, randao);
+        assertEq(expected[9], 2);
+        assertEq(box.previewOpen(single, randao)[0], 2);
+        receiver.configure(header, true);
+        vm.prank(stranger);
+        box.open(pack, header);
+        assertFalse(box.delivered(pack));
+        assertEq(box.getStoredItems(pack), expected);
+        assertEq(box.minted(seasonId, 2), 1);
+        assertEq(furniture.totalSupply(2), 0);
+        // The undelivered rare already consumes the cap, so this later pick must be fallback.
+        assertEq(box.previewOpen(single, randao)[0], 1);
+        assertOpenMatches(single, randao, header, false);
+        assertEq(box.getStoredItems(pack), expected);
+        vm.expectRevert(abi.encodeWithSelector(OGClubBox.AlreadyOpened.selector, pack));
+        box.open(pack, header);
+        receiver.configure(header, false);
+        box.deliver(pack);
+        for (uint256 id = 1; id <= 4; ++id) {
+            uint256 received;
+            for (uint256 i; i < expected.length; ++i) {
+                if (expected[i] == id) ++received;
+            }
+            assertEq(furniture.balanceOf(address(receiver), id), received);
+        }
+        assertEq(furniture.totalSupply(2), 1);
+        assertEq(box.minted(seasonId, 2), 1);
     }
 
     function testFuzz_OtherOpensOnlyDegradeSoldOutPicks(bytes32 randao, uint8 countA, uint8 countB) public {

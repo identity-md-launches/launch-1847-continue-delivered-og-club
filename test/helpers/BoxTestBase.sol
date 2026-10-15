@@ -29,7 +29,7 @@ abstract contract BoxTestBase is Test, ERC1155Holder {
         token = new MockOG(address(this));
         furniture = new OGClubFurniture(address(this), vault);
         box = new OGClubBox(token, furniture, vault, address(this));
-        furniture.setMinter(address(box), true);
+        furniture.grantMinter(address(box));
         token.mint(buyer, 1_000_000 ether);
         vm.prank(buyer);
         token.approve(address(box), type(uint256).max);
@@ -84,6 +84,8 @@ abstract contract BoxTestBase is Test, ERC1155Holder {
         }
         (,,,, bool opened) = box.purchases(purchaseId);
         assertTrue(opened);
+        assertTrue(box.delivered(purchaseId));
+        assertEq(box.getStoredItems(purchaseId).length, 0);
         assertEq(token.balanceOf(address(box)), 0);
     }
 

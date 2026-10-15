@@ -170,12 +170,14 @@ contract FurnitureHandler is Test {
     function strangerCannotAdminister(uint8 which, uint8 whoSeed) external {
         address who = holders[whoSeed % holders.length];
         bytes memory call_;
-        uint256 w = which % 5;
-        if (w == 0) call_ = abi.encodeCall(furniture.setMinter, (who, true));
+        uint256 w = which % 7;
+        if (w == 0) call_ = abi.encodeCall(furniture.grantMinter, (who));
         else if (w == 1) call_ = abi.encodeCall(furniture.setBaseURI, ("x"));
         else if (w == 2) call_ = abi.encodeCall(furniture.freezeMetadata, ());
         else if (w == 3) call_ = abi.encodeCall(furniture.setRoyalty, (who, 1));
-        else call_ = abi.encodeCall(furniture.transferOwnership, (who));
+        else if (w == 4) call_ = abi.encodeCall(furniture.transferOwnership, (who));
+        else if (w == 5) call_ = abi.encodeCall(furniture.cancelMinter, (who));
+        else call_ = abi.encodeCall(furniture.revokeMinter, (who));
         vm.prank(who);
         (bool ok, bytes memory reason) = address(furniture).call(call_);
         assertFalse(ok);
@@ -203,7 +205,7 @@ contract FurnitureInvariantTest is Test {
         furniture = new OGClubFurniture(owner, owner);
         handler = new FurnitureHandler(furniture, owner);
         vm.prank(owner);
-        furniture.setMinter(address(handler), true);
+        furniture.grantMinter(address(handler));
         handler.mint(0, 0, 5, 1);
         handler.ownerTriesToSeize(0, 0, 0);
         targetContract(address(handler));

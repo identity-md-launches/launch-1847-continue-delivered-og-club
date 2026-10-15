@@ -38,12 +38,27 @@ An item ID can be zero. Several seasons can sell at the same time.
    entry has already sold out, that box receives the fallback piece instead.
    Block hash, timestamp, coinbase and extraData do not enter the seed. The block
    where `open` runs does not supply randomness.
-5. The selected entries are counted and minted to the recorded buyer in one
-   `mintBatch` call. The purchase is marked opened and caps are updated before
-   that call. Both `buy` and `open` have a shared reentrancy guard. A rejected
-   receiver callback reverts the entire opening, which can then be retried; the
-   retry yields the same pieces, or the fallback for a pick that sold out in
-   between, so holding out never earns a better roll.
+5. The purchase is marked opened, its selected pieces are reserved against caps,
+   and `BoxOpened` events record the roll before any delivery call. The box tries
+   one `mintBatch` to the buyer. Success marks it delivered and emits
+   `Delivered(purchaseId, buyer)`. Failure saves the rolled item IDs and emits
+   `DeliveryFailed(purchaseId)`; it does **not** undo the opening or the cap counts.
+6. For a failed delivery, anyone may call `deliver(purchaseId)` to retry to the
+   buyer. Only the buyer may call `deliverTo(purchaseId, to)` to choose another
+   nonzero recipient. These calls use the stored roll, require an opened,
+   undelivered purchase, and deliver at most once. A failed retry reverts and
+   preserves the stored items. A successful retry clears them and emits
+   `Delivered(purchaseId, to)`. No header is needed and delivery has no deadline.
+
+`buy`, `open`, `deliver` and `deliverTo` share a reentrancy guard. Retry delivery
+marks the purchase delivered before minting. Only failed openings store item
+arrays; successful openings use a delivery flag packed alongside `opened` in its
+existing storage slot. Initial mint attempts forward at most
+`OPEN_MINT_GAS_LIMIT = 1,000,000` gas and retain 300,000 gas for saving up to ten
+IDs and finishing the opening. Supply enough transaction gas for rolling and
+saving the result. A receiver exhausting the forwarded gas or returning a large
+revert payload cannot veto a sufficiently funded opening. Retry calls have no
+fixed mint gas ceiling, allowing complex receivers to receive with more gas.
 
 This assumes an Ethereum proof-of-stake chain with Ethereum's execution-header
 and prevRandao semantics. It is not a VRF. **The validator proposing the block
@@ -57,11 +72,13 @@ and withholding limitation are described in
 
 Opening is allowed only when `block.number > targetBlock`. The normal reveal
 window includes `targetBlock + 256`. Starting at `targetBlock + 257`, the header is
-ignored and **every box becomes the season's fallback piece**. An expired reveal
+ignored and **every box in an unopened purchase becomes the season's fallback
+piece**. An expired reveal
 emits a zero prevRandao and `expired = true`. Expiry gives no new random roll and
 overrides the ten-pack guarantee. There is no refund or cancellation of a paid
 purchase. Anyone may pay the gas to open for the buyer, even after sales close or
-while buying is paused.
+while buying is paused. Once opened, the recorded roll never expires or changes,
+even if delivery remains pending beyond the reveal window.
 
 For a live ten-pack, index 9 is guaranteed Rare, Epic or Legendary while any such
 entry is still available. It first selects over the full original weight of every
@@ -71,21 +88,22 @@ entry remains at that moment, it uses the ordinary roll. The first nine boxes ma
 consume the last rare entries. Smaller purchases have no tier guarantee.
 
 Each pick updates the simulated availability before the next pick. A sold-out
-entry cannot be minted again; a pick that lands on it becomes the fallback. Caps
+entry cannot be selected again; a pick that lands on it becomes the fallback.
+`minted(seasonId, itemId)` counts all opened rolls, including stored, undelivered
+pieces. Retrying delivery never increments that counter or rolls again. Caps
 are **per season and per item**, not global collection limits. Other seasons or
 authorized furniture minters may mint the same piece ID. Weights are permanent
 odds of being selected; the odds of actually receiving a capped piece fall to zero
 once it sells out, and that share goes to the fallback.
 
-Because every pick is fixed by its seed, another purchase opening can only make a
-pending result worse, never better: it can sell out the piece a pending box
-selected, which then degrades to the fallback. Capped pieces go to whoever opens
-first, so a buyer who wants a capped piece should open promptly. The one
-state-dependent step is the ten-pack re-roll: when the rare a tenth box selected
-sells out, its re-roll among the remaining rares may land on a higher or lower
-tier. A buyer cannot force that sell-out beyond opening other people's purchases
-that would receive that piece anyway, which gives those buyers exactly their own
-rolls. There is no other ordering game and no way to choose among outcomes.
+For ordinary picks, another opening can only sell out the selected piece and
+replace it with fallback. Capped pieces go to whoever opens first. The guaranteed
+tenth pick is state-dependent: if its selected rare sells out before opening,
+its re-roll among the remaining rares may have a higher or lower tier. Open
+promptly; previews do not reserve inventory. Anyone can record another buyer's
+roll, and rejecting delivery cannot block that recording or obtain a later
+re-roll. Ordering and withholding before an opening is submitted still affect
+availability; the ten-pack selection rule is unchanged.
 
 `previewOpen(purchaseId, prevRandao)` uses the same roll function and cap accounting
 as `open`. It requires an existing, unopened purchase past its target block. It
@@ -124,16 +142,18 @@ its balance does not fall, so a standard token passes and a token that charges a
 fee on the self-transfer still reverts. A zero-value leg is skipped.
 
 `buy` also reverts with `BoxNotMinter` unless the furniture contract currently
-authorizes the box as a minter, so no payment is ever taken for a purchase that
-could not be opened. Sales therefore start only after the post-deployment
-`setMinter` step and stop automatically while that permission is revoked.
+authorizes the box as a minter. Sales therefore start only after the
+post-deployment `grantMinter(box)` step and stop automatically while that
+permission is revoked. Existing purchases can still be opened and their rolls
+recorded while minting is disabled.
 
 ## What the owners can and cannot do
 
 Both applications use Ownable2Step. `transferOwnership` nominates a successor;
 the successor must call `acceptOwnership` on each contract. Nominating zero
 cancels a pending transfer. `renounceOwnership` permanently removes owner powers,
-without clearing minter authorizations or undoing a paused state.
+without clearing minter authorizations or pending minter proposals, or undoing a
+paused state. Anyone may still activate an existing proposal after its deadline.
 
 The box owner can create new seasons, irreversibly close their sales, or cancel
 an unstarted season. Both closing and cancellation are terminal; a closed season
@@ -145,26 +165,52 @@ fixed, but its vault recipient follows the current vault setting.
 The box owner cannot edit an existing season's price, window, entries, tiers,
 weights, caps, fallback or split; reopen a closed season; replace the token or
 furniture contract; change a purchase's target or recipient; choose a reveal
-seed; stop `open` through the buying pause; or withdraw payment tokens. There are
+seed; stop `open`, `deliver` or `deliverTo` through the buying pause; or withdraw
+payment tokens. There are
 no proxies or upgrade paths.
 
-The furniture owner chooses authorized minters, can update the metadata prefix
-until `freezeMetadata()`, and can set a royalty receiver and rate from 0 through
-1000 basis points. Initial royalties are 500 basis points. Royalties are a
-standard signal to marketplaces, not an enforced transfer charge. Metadata is
-`baseURI + decimal itemId + ".json"`; include the desired trailing slash in the
-prefix. Freezing metadata is permanent and does not freeze royalties or minters.
+The furniture owner manages minters through these functions:
+
+- `grantMinter(minter)`: before any furniture has been minted (`totalSupply() == 0`),
+  authorizes immediately and emits `MinterSet(minter, true)`. Once any supply exists,
+  records `pendingMinters(minter) = block.timestamp + MINTER_DELAY` and emits
+  `MinterProposed(minter, activatesAt)`. **MINTER_DELAY is seven days.**
+- `activateMinter(minter)`: anyone can call at or after the proposal's timestamp;
+  it clears the proposal, authorizes the minter and emits `MinterSet(minter, true)`.
+  Elapsed time alone does not authorize minting.
+- `cancelMinter(minter)`: owner only, clears a pending proposal and emits
+  `MinterProposalCancelled(minter)`. Existing authorization is unaffected.
+- `revokeMinter(minter)`: owner only, removes authorization immediately, clears
+  any proposal, and emits `MinterSet(minter, false)`.
+
+Re-proposing restarts the full delay; proposing for an active minter leaves its
+existing permission active. Activation and cancellation require a pending
+proposal. `minters(minter)` remains the current authorization view, and
+`pendingMinters(minter)` returns zero when nothing is pending. Index `MinterSet`
+from deployment to reconstruct the full active list, including initial grants.
+
+The furniture owner can update the metadata prefix until `freezeMetadata()`, and
+set a royalty receiver and rate from 0 through 1000 basis points. Initial
+royalties are 500 basis points. Royalties are a standard signal to marketplaces,
+not an enforced transfer charge. Metadata is `baseURI + decimal itemId + ".json"`;
+include the trailing slash in the prefix. Freezing metadata does not freeze
+royalties or minters.
 
 Ownership itself grants **no ability to move, burn or confiscate anyone's
-furniture**. Holders and operators they approve retain standard ERC-1155 transfer
-rights. There is no public burn function. The owner can authorize itself or
-others to mint new tokens. It can revoke the box's minter authorization, which
-stops new sales and makes openings revert until restored. If it stays revoked
-until a pending purchase passes `targetBlock + 256`, that purchase's live roll is
-lost and it opens as fallbacks, so the furniture owner must not revoke the box
-while purchases are pending. Maintaining that permission is an operational
-responsibility of the furniture owner, who may be a different account from the
-box owner.
+furniture**. Holders and approved operators retain standard ERC-1155 transfers;
+there is no public burn function. Authorized minters can still mint any piece in
+any quantity: the delay provides public notice for new permissions, not global
+collection caps. Minters granted before the first mint retain their permission.
+Review the complete initial list and subsequent proposals.
+
+Revoking the box stops new sales and delays delivery, but **never changes a
+recorded roll**. Continue submitting openings within 256 blocks even while the
+box is revoked. After any furniture has been minted, restoring the box also
+requires `grantMinter`, seven days, then `activateMinter`; outstanding deliveries
+can then be retried. Delivery depends on maintaining or restoring this role;
+renouncing furniture ownership after revoking the box without a pending proposal
+would prevent restoration. A purchase nobody opens in time still expires to
+fallbacks. The furniture and box owners may be different accounts.
 
 Weights are bounded: a season's summed weights may not exceed `MAX_TOTAL_WEIGHT`
 (2^128), which keeps the modulo reduction of the 256-bit seed unbiased to within
@@ -193,17 +239,21 @@ directly for parameterized local tests, without environment variables.
 
 After deployment, the furniture owner must:
 
-1. Call `furniture.setMinter(box, true)` with the confirmed box address. Until
-   this is done every `buy` reverts with `BoxNotMinter`.
+1. Call `furniture.grantMinter(box)` with the confirmed box address **right after
+   deployment, before any mint**. This is immediate while `totalSupply() == 0`.
+   Until authorization every `buy` reverts with `BoxNotMinter`. If anything was
+   already minted, wait seven days and call `activateMinter(box)` before sales.
 2. Call `furniture.setBaseURI(...)` with the published metadata prefix. Check the
    files, then optionally call `freezeMetadata()`.
 
 The box owner then creates seasons with the intended prices, windows, entries
 and fallback. Confirm token allowances, recipient balances and mint permissions
-before opening sales. Keep the collection's box minter permission enabled while
-purchases remain unopened. Monitor `BoxesBought`, obtain headers and submit
-reveals within the 256-block window. Buyers or independent relayers can do this;
-there is no privileged opener or built-in keeper.
+before opening sales. Keep the box's minting permission enabled for prompt
+delivery. Monitor `BoxesBought`, obtain headers and submit reveals within the
+256-block window even if minting is disabled. Monitor `DeliveryFailed` and retry
+with `deliver`, or have the buyer call `deliverTo` if it cannot receive furniture.
+Buyers or independent relayers can submit openings and ordinary retries; there
+is no privileged opener or built-in keeper.
 
 To prepare a header, fetch the target execution block with
 `eth_getBlockByNumber` and encode its header fields in consensus order. The
@@ -217,18 +267,20 @@ It supports execution headers through Prague. Check `cast keccak` of its output
 against the block's published hash before passing the hex bytes to `open`.
 Future forks that append header fields may require updating this off-chain
 encoder; the contract accepts additional trailing fields already. Use the block
-header itself, not the whole block or JSON encoding. **A contract buyer must
-implement the ERC-1155 single and batch receiver callbacks.** The box does not
-call the buyer to check this (its only external calls are to the token and the
-furniture), and a purchase can only ever be delivered to its recorded buyer, so a
-contract without those callbacks pays for a purchase that can never be opened,
-even after expiry. This is a hard limitation; use an EOA or a receiver-capable
-wallet.
+header itself, not the whole block or JSON encoding. A contract buyer can receive
+directly if it implements the ERC-1155 receiver callbacks. Otherwise opening still
+records its roll, and the buyer contract must be able to call
+`deliverTo(purchaseId, recipient)` to receive at an EOA or compatible contract.
+Only that buyer can authorize redirection; the box owner cannot do it for them.
 
 `getSeason(id)` and `getEntries(id)` expose season terms. `minted(seasonId,itemId)`
-and `purchases(id)` expose accounting. Index `SeasonCreated`, `SeasonEntry`,
-`BoxesBought` and `BoxOpened`; no per-user purchase arrays are stored. `BoxOpened`
-includes purchase ID, zero-based index, piece ID, tier, prevRandao and expiry flag.
+and the unchanged five-field `purchases(id)` view expose purchase accounting.
+`delivered(id)` reports delivery status; `getStoredItems(id)` returns the ordered
+rolled IDs, including duplicates, only while a failed delivery is outstanding.
+Index `SeasonCreated`, `SeasonEntry`, `BoxesBought`, `BoxOpened`, `DeliveryFailed`
+and `Delivered`; no per-user purchase arrays are stored. `BoxOpened` includes
+purchase ID, zero-based index, piece ID, tier, prevRandao and expiry flag; it
+records the roll regardless of delivery. `Delivered` includes the actual recipient.
 Administrative changes and ownership handovers also emit events.
 
 `src/mocks/MockOG.sol` is **tests/testnets only**. Its symbol is **mockog**, it has
@@ -242,7 +294,7 @@ With Foundry and Solidity 0.8.26 available, no dependency download is needed:
 
 ```sh
 forge build
-FOUNDRY_FUZZ_SEED=0xd128ae280d16b8fe9fae2867fece2294232031c7e2780fa9c5d34bf71f39fb9d forge test
+FOUNDRY_FUZZ_SEED=0x5fbefb26c0c2c1788540f6d50945b685a8eec10a4788d431c33daee28f75b7c5 forge test
 forge fmt --check
 ```
 
@@ -251,14 +303,17 @@ filesystem permissions, or FFI are required. Real mainnet headers from Shanghai,
 Cancun and Prague are embedded, with their original published fields and hashes
 under [test/fixtures](test/fixtures/SOURCES.md). The suite covers payment splits,
 malformed headers, all sale/reveal boundaries, access control, ownership, caps,
-ten-packs, callback rollback and reentrancy. `test/FixedOdds.t.sol` checks that
-another purchase's opening never re-maps a pending roll, that a rejected delivery
-retried after a sell-out yields the same pieces, and that a sell-out only
-degrades the pick that landed on the sold-out piece. A statistical test samples 20,000
+ten-packs, delayed minter activation, rejected delivery, redirection, gas exhaustion
+and reentrancy. `test/FixedOdds.t.sol` checks that
+ordinary picks retain their original weight intervals, rejected delivery preserves
+its roll and cap reservation, and the guaranteed tenth pick cannot be upgraded
+by rejecting delivery after an opening is submitted. A statistical test samples 20,000
 prevRandao values derived from fuzz entropy and checks each no-cap frequency
 within one percentage point of its weight share. It suspends gas metering only
 for those independent view queries. Stateful invariants check custody, payment
-conservation, caps, supply, one-time opening and preview/open equality.
+conservation, caps, one-time opening/delivery and preview/open equality. The
+delivery invariant accounts for every reserved piece as delivered ERC-1155 supply
+plus stored undelivered items, with receiver rejection and retry interleavings.
 
 These local checks are not an independent security audit. A separate adversarial
 review and verification of deployment parameters remain release responsibilities.

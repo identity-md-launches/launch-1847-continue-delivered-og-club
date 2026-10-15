@@ -40,12 +40,17 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         uint256 count;
         uint256 targetBlock;
         bool opened;
+        bool delivered;
     }
 
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
     uint256 public constant BPS = 10_000;
     uint256 public constant TARGET_DELAY = 3;
     uint256 public constant REVEAL_WINDOW = 256;
+    /// @notice Initial delivery gas ceiling; retries may use more gas for complex receivers.
+    uint256 public constant OPEN_MINT_GAS_LIMIT = 1_000_000;
+    // Enough for ten cold item slots, the array length, and catch/return overhead after a failed call.
+    uint256 private constant DELIVERY_RESERVE_GAS = 300_000;
     /// @notice Upper bound of a season's summed weights, so `seed % totalWeight` is unbiased to within 2^-128.
     uint256 public constant MAX_TOTAL_WEIGHT = 1 << 128;
 
@@ -59,7 +64,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     mapping(uint256 seasonId => Season) private _seasons;
     mapping(uint256 seasonId => Entry[]) private _entries;
     mapping(uint256 seasonId => mapping(uint256 itemId => uint256 amount)) public minted;
-    mapping(uint256 purchaseId => Purchase) public purchases;
+    mapping(uint256 purchaseId => Purchase) private _purchases;
+    mapping(uint256 purchaseId => uint256[] itemIds) private _storedItems;
 
     error InvalidAddress();
     error InvalidEntryCount();
@@ -79,6 +85,10 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     error ShortTransfer(address recipient, uint256 expected, uint256 received);
     error UnknownPurchase(uint256 purchaseId);
     error AlreadyOpened(uint256 purchaseId);
+    error NotOpened(uint256 purchaseId);
+    error AlreadyDelivered(uint256 purchaseId);
+    error NoStoredItems(uint256 purchaseId);
+    error NotBuyer(uint256 purchaseId);
     error TargetBlockNotPassed(uint256 targetBlock);
     error HeaderHashMismatch();
     error HeaderNumberMismatch(uint256 expected, uint256 actual);
@@ -109,6 +119,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     event BoxOpened(
         uint256 indexed purchaseId, uint256 index, uint256 itemId, uint8 tier, bytes32 prevRandao, bool expired
     );
+    event Delivered(uint256 indexed purchaseId, address indexed to);
+    event DeliveryFailed(uint256 indexed purchaseId);
 
     /// @param token_ ERC-20 used for prices, in that token's smallest units.
     /// @param furniture_ Furniture contract which must authorize this box as a minter after deployment.
@@ -188,7 +200,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     /// @notice Pay for 1–10 boxes and commit to a target three blocks in the future.
     /// @dev Both payment legs go directly from the buyer to their recipients. A revert is atomic.
     ///      Sales require the furniture contract to currently authorize this box as a minter, so no
-    ///      payment is taken for a purchase that could not open.
+    ///      payment is taken while the box's minting permission is revoked.
     function buy(uint256 seasonId, uint256 count) external nonReentrant returns (uint256 purchaseId) {
         Season storage season = _season(seasonId);
         if (count == 0 || count > 10) revert InvalidCount();
@@ -204,7 +216,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         address recipient = vault;
         uint256 targetBlock = block.number + TARGET_DELAY;
         purchaseId = ++purchaseCount;
-        purchases[purchaseId] = Purchase(msg.sender, seasonId, count, targetBlock, false);
+        _purchases[purchaseId] = Purchase(msg.sender, seasonId, count, targetBlock, false, false);
 
         _pay(BURN_ADDRESS, burnAmt);
         _pay(recipient, vaultAmt);
@@ -212,7 +224,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Open a purchase for its buyer using the target block's complete RLP header.
-    /// @dev Expired purchases ignore the header and mint only the fallback. All accounting precedes the sole mint call.
+    /// @dev Expired purchases ignore the header and roll only the fallback. Caps reserve even undelivered items.
+    ///      Delivery failures store the final roll for retry; receiver callbacks cannot veto the opening.
     function open(uint256 purchaseId, bytes calldata header) external nonReentrant {
         Purchase memory purchase = _openable(purchaseId);
         bool expired = block.number - purchase.targetBlock > REVEAL_WINDOW;
@@ -224,7 +237,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
             if (number != purchase.targetBlock) revert HeaderNumberMismatch(purchase.targetBlock, number);
         }
 
-        purchases[purchaseId].opened = true;
+        _purchases[purchaseId].opened = true;
         (uint256[] memory ids, uint8[] memory tiers) = _roll(purchaseId, purchase, prevRandao, expired);
         uint256[] memory amounts = new uint256[](purchase.count);
         for (uint256 i; i < purchase.count; ++i) {
@@ -232,7 +245,66 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
             amounts[i] = 1;
             emit BoxOpened(purchaseId, i, ids[i], tiers[i], prevRandao, expired);
         }
-        furniture.mintBatch(purchase.buyer, ids, amounts);
+        // Bound forwarded gas AND retain enough to save the largest roll even if the receiver exhausts it.
+        uint256 mintGas = gasleft();
+        mintGas = mintGas > DELIVERY_RESERVE_GAS ? Math.min(OPEN_MINT_GAS_LIMIT, mintGas - DELIVERY_RESERVE_GAS) : 0;
+        try furniture.mintBatch{gas: mintGas}(purchase.buyer, ids, amounts) {
+            _purchases[purchaseId].delivered = true;
+            emit Delivered(purchaseId, purchase.buyer);
+        } catch {
+            _storedItems[purchaseId] = ids;
+            emit DeliveryFailed(purchaseId);
+        }
+    }
+
+    /// @notice Anyone may retry delivery of an opened purchase's recorded items to its buyer.
+    function deliver(uint256 purchaseId) external nonReentrant {
+        _deliver(purchaseId, _purchases[purchaseId].buyer);
+    }
+
+    /// @notice The buyer may redirect a failed delivery to another nonzero recipient.
+    function deliverTo(uint256 purchaseId, address to) external nonReentrant {
+        if (_purchases[purchaseId].buyer != msg.sender) revert NotBuyer(purchaseId);
+        if (to == address(0)) revert InvalidAddress();
+        _deliver(purchaseId, to);
+    }
+
+    function _deliver(uint256 purchaseId, address to) private {
+        Purchase storage purchase = _purchases[purchaseId];
+        if (purchase.buyer == address(0)) revert UnknownPurchase(purchaseId);
+        if (!purchase.opened) revert NotOpened(purchaseId);
+        if (purchase.delivered) revert AlreadyDelivered(purchaseId);
+        uint256[] memory ids = _storedItems[purchaseId];
+        if (ids.length == 0) revert NoStoredItems(purchaseId);
+        purchase.delivered = true;
+        delete _storedItems[purchaseId];
+        uint256[] memory amounts = new uint256[](ids.length);
+        for (uint256 i; i < ids.length; ++i) {
+            amounts[i] = 1;
+        }
+        // A revert restores both the delivered flag and stored items, allowing another retry.
+        furniture.mintBatch(to, ids, amounts);
+        emit Delivered(purchaseId, to);
+    }
+
+    /// @notice Original purchase view; delivery status is exposed separately without changing this ABI.
+    function purchases(uint256 purchaseId)
+        external
+        view
+        returns (address buyer, uint256 seasonId, uint256 count, uint256 targetBlock, bool opened)
+    {
+        Purchase storage purchase = _purchases[purchaseId];
+        return (purchase.buyer, purchase.seasonId, purchase.count, purchase.targetBlock, purchase.opened);
+    }
+
+    /// @notice Whether the purchase has been delivered, either at open or by a later retry.
+    function delivered(uint256 purchaseId) external view returns (bool) {
+        return _purchases[purchaseId].delivered;
+    }
+
+    /// @notice Final rolled IDs, in box order with duplicates, only while a failed delivery is outstanding.
+    function getStoredItems(uint256 purchaseId) external view returns (uint256[] memory) {
+        return _storedItems[purchaseId];
     }
 
     /// @notice Predict an open using current caps and the supplied prevRandao (not authenticated by this view).
@@ -279,7 +351,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     }
 
     function _openable(uint256 purchaseId) private view returns (Purchase memory purchase) {
-        purchase = purchases[purchaseId];
+        purchase = _purchases[purchaseId];
         if (purchase.buyer == address(0)) revert UnknownPurchase(purchaseId);
         if (purchase.opened) revert AlreadyOpened(purchaseId);
         if (block.number <= purchase.targetBlock) revert TargetBlockNotPassed(purchase.targetBlock);

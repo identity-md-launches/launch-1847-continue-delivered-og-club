@@ -428,7 +428,7 @@ contract MultiActorInvariantTest is Test {
         token = new MockOG(address(this));
         furniture = new OGClubFurniture(address(this), vault);
         box = new OGClubBox(token, furniture, vault, address(this));
-        furniture.setMinter(address(box), true);
+        furniture.grantMinter(address(box));
         handler = new MultiActorHandler(box, furniture, token, address(this));
 
         OGClubBox.Entry[] memory a = new OGClubBox.Entry[](3);
@@ -531,6 +531,9 @@ contract MultiActorInvariantTest is Test {
             assertTrue(count >= 1 && count <= 10);
             assertEq(opened, handler.ghostOpened(id), "opened flag drifted");
             if (opened) ++openedCount;
+            // This handler uses EOAs exclusively, so every opening delivers immediately.
+            assertEq(box.delivered(id), opened);
+            assertEq(box.getStoredItems(id).length, 0);
         }
         assertEq(openedCount, handler.opens());
         for (uint256 s = 1; s <= box.seasonCount(); ++s) {

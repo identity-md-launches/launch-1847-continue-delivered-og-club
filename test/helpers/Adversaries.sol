@@ -95,6 +95,12 @@ contract ReentrantBuyer is ERC1155Holder {
     bytes4 public openError;
     bytes4 public buyError;
     bool public reject;
+    bool public sawDelivered;
+    bool public deliverSucceeded;
+    bool public deliverToSucceeded;
+    bool public otherDeliverSucceeded;
+    bytes4 public deliverError;
+    bytes4 public deliverToError;
 
     constructor(OGClubBox box_, IERC20 token_, uint256 season_) {
         box = box_;
@@ -118,7 +124,13 @@ contract ReentrantBuyer is ERC1155Holder {
         require(!reject, "test receiver rejects");
         ++callbacks;
         (,,,, sawOpened) = box.purchases(purchaseId);
+        sawDelivered = box.delivered(purchaseId);
         bytes memory reason;
+        (deliverSucceeded, reason) = address(box).call(abi.encodeCall(box.deliver, (purchaseId)));
+        deliverError = bytes4(reason);
+        (deliverToSucceeded, reason) = address(box).call(abi.encodeCall(box.deliverTo, (purchaseId, address(this))));
+        deliverToError = bytes4(reason);
+        (otherDeliverSucceeded,) = address(box).call(abi.encodeCall(box.deliver, (otherPurchaseId)));
         (openSucceeded, reason) = address(box).call(abi.encodeCall(box.open, (purchaseId, header)));
         openError = bytes4(reason);
         (otherOpenSucceeded,) = address(box).call(abi.encodeCall(box.open, (otherPurchaseId, header)));
@@ -137,6 +149,82 @@ contract ReentrantBuyer is ERC1155Holder {
         returns (bytes4)
     {
         _callback();
+        return this.onERC1155BatchReceived.selector;
+    }
+}
+
+/// @dev Simulates both all-gas consumption and a large revert payload from an untrusted receiver.
+contract HostileDeliveryBuyer is ERC1155Holder {
+    uint8 public mode;
+
+    function buy(OGClubBox box, IERC20 token, uint256 season, uint256 count) external returns (uint256) {
+        token.approve(address(box), type(uint256).max);
+        return box.buy(season, count);
+    }
+
+    function setMode(uint8 value) external {
+        mode = value;
+    }
+
+    function deliverTo(OGClubBox box, uint256 purchase, address to) external {
+        box.deliverTo(purchase, to);
+    }
+
+    function _reject() internal view {
+        if (mode == 1) {
+            assembly ("memory-safe") { invalid() }
+        } else if (mode == 2) {
+            // A payload large enough to exercise returndata handling, bounded by forwarded gas.
+            assembly { revert(0, 0x40000) }
+        }
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes memory) public view override returns (bytes4) {
+        _reject();
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] memory, uint256[] memory, bytes memory)
+        public
+        view
+        override
+        returns (bytes4)
+    {
+        _reject();
+        return this.onERC1155BatchReceived.selector;
+    }
+}
+
+/// @dev Rejects initial delivery, then accepts retries based on the box's delivery flag.
+///      A counter increment inside a reverting callback would itself roll back.
+contract RetryOnlyBuyer is ERC1155Holder {
+    OGClubBox public box;
+    uint256 public purchase;
+    uint256 public accepted;
+
+    function buy(OGClubBox box_, IERC20 token, uint256 season, uint256 count) external returns (uint256) {
+        box = box_;
+        token.approve(address(box), type(uint256).max);
+        purchase = box.buy(season, count);
+        return purchase;
+    }
+
+    function _receive() internal {
+        require(box.delivered(purchase), "reject initial delivery");
+        ++accepted;
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes memory) public override returns (bytes4) {
+        _receive();
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] memory, uint256[] memory, bytes memory)
+        public
+        override
+        returns (bytes4)
+    {
+        _receive();
         return this.onERC1155BatchReceived.selector;
     }
 }
