@@ -47,10 +47,14 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     uint256 public constant BPS = 10_000;
     uint256 public constant TARGET_DELAY = 3;
     uint256 public constant REVEAL_WINDOW = 256;
-    /// @notice Initial delivery gas ceiling; retries may use more gas for complex receivers.
+    /// @notice Gas forwarded to the initial delivery mint, always in full; retries may use more gas.
     uint256 public constant OPEN_MINT_GAS_LIMIT = 1_000_000;
-    // Enough for ten cold item slots, the array length, and catch/return overhead after a failed call.
-    uint256 private constant DELIVERY_RESERVE_GAS = 300_000;
+    /// @notice Gas kept back from the mint: enough for ten cold item slots, the array length and catch overhead.
+    uint256 public constant DELIVERY_RESERVE_GAS = 300_000;
+    /// @notice Gas that must remain when delivery starts, or `open` reverts with InsufficientGas instead of
+    ///         recording a delivery failure. Gas estimation therefore lands above it and no caller can starve
+    ///         the mint of its full budget.
+    uint256 public constant OPEN_DELIVERY_GAS = OPEN_MINT_GAS_LIMIT + DELIVERY_RESERVE_GAS;
     /// @notice Upper bound of a season's summed weights, so `seed % totalWeight` is unbiased to within 2^-128.
     uint256 public constant MAX_TOTAL_WEIGHT = 1 << 128;
 
@@ -93,6 +97,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     error HeaderHashMismatch();
     error HeaderNumberMismatch(uint256 expected, uint256 actual);
     error NoAvailableItems();
+    error InsufficientGas(uint256 required, uint256 available);
 
     event SeasonCreated(
         uint256 indexed seasonId,
@@ -226,6 +231,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     /// @notice Open a purchase for its buyer using the target block's complete RLP header.
     /// @dev Expired purchases ignore the header and roll only the fallback. Caps reserve even undelivered items.
     ///      Delivery failures store the final roll for retry; receiver callbacks cannot veto the opening.
+    ///      Reverts with InsufficientGas unless OPEN_DELIVERY_GAS remains when delivery starts.
     function open(uint256 purchaseId, bytes calldata header) external nonReentrant {
         Purchase memory purchase = _openable(purchaseId);
         bool expired = block.number - purchase.targetBlock > REVEAL_WINDOW;
@@ -245,10 +251,12 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
             amounts[i] = 1;
             emit BoxOpened(purchaseId, i, ids[i], tiers[i], prevRandao, expired);
         }
-        // Bound forwarded gas AND retain enough to save the largest roll even if the receiver exhausts it.
-        uint256 mintGas = gasleft();
-        mintGas = mintGas > DELIVERY_RESERVE_GAS ? Math.min(OPEN_MINT_GAS_LIMIT, mintGas - DELIVERY_RESERVE_GAS) : 0;
-        try furniture.mintBatch{gas: mintGas}(purchase.buyer, ids, amounts) {
+        // A caller short of gas is a precondition failure, not a delivery failure: revert the whole opening rather
+        // than starve the mint and store a healthy roll. Past this check the mint always receives its full budget
+        // and the reserve still saves the largest roll even if the receiver exhausts that budget.
+        uint256 available = gasleft();
+        if (available < OPEN_DELIVERY_GAS) revert InsufficientGas(OPEN_DELIVERY_GAS, available);
+        try furniture.mintBatch{gas: OPEN_MINT_GAS_LIMIT}(purchase.buyer, ids, amounts) {
             _purchases[purchaseId].delivered = true;
             emit Delivered(purchaseId, purchase.buyer);
         } catch {

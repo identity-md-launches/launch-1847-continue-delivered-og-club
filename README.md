@@ -53,12 +53,20 @@ An item ID can be zero. Several seasons can sell at the same time.
 `buy`, `open`, `deliver` and `deliverTo` share a reentrancy guard. Retry delivery
 marks the purchase delivered before minting. Only failed openings store item
 arrays; successful openings use a delivery flag packed alongside `opened` in its
-existing storage slot. Initial mint attempts forward at most
-`OPEN_MINT_GAS_LIMIT = 1,000,000` gas and retain 300,000 gas for saving up to ten
-IDs and finishing the opening. Supply enough transaction gas for rolling and
-saving the result. A receiver exhausting the forwarded gas or returning a large
-revert payload cannot veto a sufficiently funded opening. Retry calls have no
-fixed mint gas ceiling, allowing complex receivers to receive with more gas.
+existing storage slot. The initial mint attempt always receives exactly
+`OPEN_MINT_GAS_LIMIT = 1,000,000` gas, and the box keeps
+`DELIVERY_RESERVE_GAS = 300,000` gas back for saving up to ten IDs and finishing
+the opening. If fewer than `OPEN_DELIVERY_GAS = 1,300,000` gas remain when
+delivery starts, `open` reverts with `InsufficientGas(required, available)` and
+changes nothing. A short gas limit is therefore a caller precondition failure,
+never a `DeliveryFailed`: the gas a caller attaches cannot decide whether a
+healthy buyer is delivered or left with a stored roll, and `eth_estimateGas`
+returns a limit above the threshold. In the test suite the lowest succeeding
+limit is about 1.42M gas for one box, 1.54M for a ten-pack in a three-entry
+season and 2.30M for a ten-pack in a 32-entry season; unused gas is refunded as
+usual. A receiver exhausting the forwarded gas or returning a large revert
+payload cannot veto an opening. Retry calls have no fixed mint gas ceiling,
+allowing complex receivers to receive with more gas.
 
 This assumes an Ethereum proof-of-stake chain with Ethereum's execution-header
 and prevRandao semantics. It is not a VRF. **The validator proposing the block
@@ -160,7 +168,12 @@ an unstarted season. Both closing and cancellation are terminal; a closed season
 cannot subsequently be cancelled. Cancellation must occur strictly before
 `opensAt`, when it has no purchases. The owner can also pause/resume purchases
 and change the vault for future purchases. A season's percentage split stays
-fixed, but its vault recipient follows the current vault setting.
+fixed, but its vault recipient follows the current vault setting. A new season
+may reuse any piece ID, including one an earlier season sold with a cap, as an
+uncapped entry or fallback: caps are per season, and the box's existing minter
+role is not subject to the furniture's seven-day notice. The box owner's season
+terms are therefore a trust assumption; review each `SeasonCreated` and
+`SeasonEntry` event.
 
 The box owner cannot edit an existing season's price, window, entries, tiers,
 weights, caps, fallback or split; reopen a closed season; replace the token or
@@ -183,6 +196,9 @@ The furniture owner manages minters through these functions:
 - `revokeMinter(minter)`: owner only, removes authorization immediately, clears
   any proposal, and emits `MinterSet(minter, false)`.
 
+`totalSupply()` counts delivered furniture only. Purchases that were opened but
+whose delivery failed (for example while the box was revoked) do not arm the
+delay: until the first piece is actually minted, every grant stays immediate.
 Re-proposing restarts the full delay; proposing for an active minter leaves its
 existing permission active. Activation and cancellation require a pending
 proposal. `minters(minter)` remains the current authorization view, and
@@ -250,7 +266,9 @@ The box owner then creates seasons with the intended prices, windows, entries
 and fallback. Confirm token allowances, recipient balances and mint permissions
 before opening sales. Keep the box's minting permission enabled for prompt
 delivery. Monitor `BoxesBought`, obtain headers and submit reveals within the
-256-block window even if minting is disabled. Monitor `DeliveryFailed` and retry
+256-block window even if minting is disabled. Send `open` with the estimated gas
+limit; a limit below the published minimum reverts with `InsufficientGas` and
+costs only the failed call. Monitor `DeliveryFailed` and retry
 with `deliver`, or have the buyer call `deliverTo` if it cannot receive furniture.
 Buyers or independent relayers can submit openings and ordinary retries; there
 is no privileged opener or built-in keeper.
@@ -304,7 +322,10 @@ Cancun and Prague are embedded, with their original published fields and hashes
 under [test/fixtures](test/fixtures/SOURCES.md). The suite covers payment splits,
 malformed headers, all sale/reveal boundaries, access control, ownership, caps,
 ten-packs, delayed minter activation, rejected delivery, redirection, gas exhaustion
-and reentrancy. `test/FixedOdds.t.sol` checks that
+and reentrancy. `test/OpenGas.t.sol` checks that a short gas limit reverts
+without state changes, that the lowest succeeding limit always delivers, and
+that the reserve stores ten distinct IDs at that exact boundary against a
+receiver that burns the whole mint budget. `test/FixedOdds.t.sol` checks that
 ordinary picks retain their original weight intervals, rejected delivery preserves
 its roll and cap reservation, and the guaranteed tenth pick cannot be upgraded
 by rejecting delivery after an opening is submitted. A statistical test samples 20,000

@@ -11,12 +11,14 @@ or payment-token change was made. Constructors and the existing five-field
 | --- | --- | --- |
 | `src/OGClubFurniture.sol` | Replaced `setMinter` with owner-only `grantMinter`, `cancelMinter`, `revokeMinter`, and permissionless `activateMinter`. Grants are immediate only at zero total supply; otherwise activation requires seven days. Added `pendingMinters`, proposal/cancellation events, and explicit missing/early proposal errors. Immediate grants and activations both emit `MinterSet`. Revoke clears proposals immediately. Re-proposing restarts the delay; cancellation leaves an already-active permission intact. | Requested change 1; audit `c74ac643813b`. Prevent immediate authorization of new arbitrary minting after the collection exists. |
 | `src/OGClubBox.sol` | `open` reserves caps and records `BoxOpened` before attempting delivery in `try/catch`. Successful minting sets delivery status and emits `Delivered`; failure stores ordered IDs and emits `DeliveryFailed`. Added permissionless `deliver`, buyer-only `deliverTo`, `delivered` and `getStoredItems`. Retry effects precede minting and roll back on failure. Successful retries clear stored IDs. All four purchase/delivery entry points share the reentrancy guard. | Requested change 2; audits `e0a50d6e49b9`, `460e31d87310`, `5926736c3fa8`. Preserve a recorded roll through revocation, receiver rejection, cap depletion and expiry, and allow a non-receiver buyer to redirect it. |
-| `src/OGClubBox.sol` | Delivery status shares the existing `opened` storage slot. The purchase getter keeps its old return values. Only failed initial deliveries allocate stored ID arrays. Initial mint gas is capped at the named `OPEN_MINT_GAS_LIMIT` of 1,000,000; forwarding also retains 300,000 gas for up to ten cold ID slots, the array length and failure-path overhead. Retries have no fixed gas cap. | Requested normal-path storage constraint; the gas-exhaustion warning in audit `5926736c3fa8`. A receiver must not exhaust the caller's ability to save its roll. A transaction still needs enough gas to execute the opening and store the result. |
+| `src/OGClubBox.sol` | Delivery status shares the existing `opened` storage slot. The purchase getter keeps its old return values. Only failed initial deliveries allocate stored ID arrays. The initial mint always receives exactly the named `OPEN_MINT_GAS_LIMIT` of 1,000,000; the box keeps the now-public `DELIVERY_RESERVE_GAS` of 300,000 for up to ten cold ID slots, the array length and failure-path overhead. Retries have no fixed gas cap. | Requested normal-path storage constraint; the gas-exhaustion warning in audit `5926736c3fa8`. A receiver must not exhaust the caller's ability to save its roll. |
+| `src/OGClubBox.sol` (revision) | `open` reverts with `InsufficientGas(required, available)` when fewer than `OPEN_DELIVERY_GAS` (mint budget plus reserve, 1,300,000) gas remain at the delivery step. The revert undoes the whole call, so a short caller changes nothing. Previously the mint was given `min(limit, gasleft - reserve)` and a starved mint was caught as a delivery failure. | Review finding `a01cf2893652`: with the old forwarding rule, `eth_estimateGas` and any opener attaching roughly 1.0-1.5x the measured gas landed a healthy EOA buyer on the `DeliveryFailed` path, writing the stored-items array the brief says the normal path must never add and letting a stranger choose the buyer's path. A short gas limit is now a caller precondition, so "open must not revert because of delivery" still holds and every succeeding open forwards the full mint budget. |
+| `test/OpenGas.t.sol`, `test/Delivery.t.sol` | New tests: the measured gas, 1.5x of it and 600,000 all revert with `InsufficientGas` and leave the purchase untouched; the lowest succeeding gas limit (an estimate) delivers and stores nothing for every count; at that exact boundary a receiver that burns the whole mint budget or returns a huge revert payload still gets its ten distinct IDs stored; the published constants are consistent. The hostile-receiver test no longer hard-codes a 1.2M limit, which the new precondition rejects for a 32-entry ten-pack. | Review finding `a01cf2893652`; its supplied proof passes on the revised tree. |
 | `test/OGClubFurniture.t.sol`, `test/FurnitureInvariant.t.sol` | Test initial grants/events, exact seven-day boundary, early and missing activation, arbitrary activators, cancellation, immediate revoke, proposal deletion/replacement, role access and removal of the old selector. Keep ownership, transfer, metadata and royalty checks. | Requested furniture tests and audit `c74ac643813b`. |
 | `test/Opening.t.sol`, `test/EdgeCases.t.sol`, `test/FixedOdds.t.sol`, `test/Delivery.t.sol`, `test/helpers/Adversaries.sol` | Replace old rollback expectations with recorded-roll and retry expectations. Cover revoked minter through reveal expiry and delayed restoration, non-receiver redirection, first-attempt-only rejection, retry failure/atomicity, single/batch callback reentrancy, at-most-once delivery, undelivered cap reservation, capped-piece owner mint attempts, zero/duplicate IDs, unopened expiry and receivers that exhaust gas or return large revert data. | All requested box tests and audits `e0a50d6e49b9`, `460e31d87310`, `c74ac643813b`, `5926736c3fa8`, `b2396477958b`. |
 | `test/BoxInvariant.t.sol`, `test/MultiActorInvariant.t.sol`, `test/helpers/BoxTestBase.sol` | Check reserved per-item counts equal delivered supply plus stored undelivered IDs. Stateful actions reject, retry and redirect deliveries, verify immutable recorded-roll hashes, and count successful deliveries independently. Retain cap, payment-conservation, zero box-token balance and one-time opening checks. Successful normal opens must be delivered with no stored items. | Requested invariants; audit `b2396477958b`. |
 | Other affected test fixtures (`test/Payments.t.sol`, `test/Seasons.t.sol`, shared setup and invariant setup) | Replace old minter API calls with grants/revokes. Their existing payment, season, selection and ownership expectations remain intact. | API migration required by requested change 1. |
-| `README.md` | Document opening versus delivery, all new views/events and role operations, notice-period limitations, gas limits, preserved expiry, permissionless retries, buyer redirection, and `grantMinter(box)` immediately after deployment before any mint. Correct the overly broad claim that every pending ten-pack can only get worse: its existing guaranteed-tenth-pick rule remains state-dependent until opening. | Requested README changes; audits `5926736c3fa8` and `b59f42caf97d`. |
+| `README.md` | Document opening versus delivery, all new views/events and role operations, notice-period limitations, gas limits, preserved expiry, permissionless retries, buyer redirection, and `grantMinter(box)` immediately after deployment before any mint. Correct the overly broad claim that every pending ten-pack can only get worse: its existing guaranteed-tenth-pick rule remains state-dependent until opening. Revision: document the `InsufficientGas` precondition, the published gas constants and measured minimum limits, that `totalSupply()` counts delivered furniture only so undelivered rolls do not arm the minter delay, and that a new season may reuse a previously capped piece ID as a per-season trust assumption on the box owner. | Requested README changes; audits `5926736c3fa8` and `b59f42caf97d`; review findings `a01cf2893652`, `3657507a218b`, `c4bb910a089f`. |
 
 ## Imported audit reproduction
 
@@ -49,6 +51,32 @@ proofs were copied to disposable `test/scratch/` and executed:
   authorization and the existing Sepolia mock. No constructor redesign or new token
   was needed. `MockOG` remains testnet-only and carries no scarcity guarantee.
 
+## Revision after independent review
+
+- `a01cf2893652` (medium): reproduced. The supplied proof failed on the accepted
+  tree with "open succeeded with 1.5x the measured gas but silently took the
+  DeliveryFailed path". Fixed as described above; the proof and the new
+  `test/OpenGas.t.sol` pass. The check sits at the delivery step rather than at
+  the top of `open` so that it is exact for every season size: a fixed top-level
+  constant would have to over-approximate the roll's cost (about 235k gas for a
+  three-entry ten-pack, about 940k for a 32-entry ten-pack). A revert at that
+  point undoes every effect of the call, so nothing is recorded for a short caller.
+- `c4bb910a089f` (low, advisory): the behaviour reproduces but is the project's
+  documented per-season cap design, which the brief asks to keep unchanged, and
+  the requested guarantee is about `grantMinter` on the furniture, which the
+  permanent test covers. Closing it would need a scope decision (a season-creation
+  notice period, rejecting reused capped IDs, or collection-level caps). Not
+  changed; documented in the README as a trust assumption on the box owner.
+- `3657507a218b` (low, advisory): the behaviour reproduces and is the brief's
+  literal condition ("while nothing has ever been minted, `totalSupply() == 0`").
+  Arming the delay on the first grant or on any active minter would change that
+  stated rule and make a corrective second grant before the first mint wait seven
+  days. Not changed; the README now states that supply counts delivered furniture
+  only and that undelivered rolls do not arm the delay.
+- `7a9836e0aa3f` (info, advisory): pre-existing ten-pack re-roll behaviour the
+  brief asks to keep, already documented in the README as state-dependent. Not
+  changed.
+
 No reported application finding was left unreproduced. The delay is a notice
 period, not a global furniture cap: existing minters, initially granted minters,
 and newly activated minters retain the requested unrestricted mint interface.
@@ -73,9 +101,10 @@ or test this change.
   supplied protected deployment/ownership tests were read; their factory harness
   needs verifier-generated deployment inputs and was not executed here.
 
-Final results: **95 permanent tests passed, zero failed or skipped**, using the
-supplied verifier seed, after removing the disposable proofs. Before removal,
-all **98 tests including the three supplied proofs** passed. `forge build`,
+Final results after the revision: **99 permanent tests passed, zero failed or
+skipped**, using the supplied verifier seed, excluding disposable `test/scratch/`.
+With the review proof for `a01cf2893652` copied there, **101 tests** passed; the
+three earlier audit proofs passed before the first submission. `forge build`,
 `forge fmt --check` and `git diff --check` passed. Runtime sizes are 11,811 bytes
 for OGClubBox, 8,949 for OGClubFurniture and 1,851 for MockOG, below EIP-170.
 Foundry's nonfatal lint messages include timestamp comparisons and post-call

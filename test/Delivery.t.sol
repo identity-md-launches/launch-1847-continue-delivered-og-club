@@ -152,8 +152,8 @@ contract DeliveryTest is BoxTestBase {
             receiver.setMode(mode);
             vm.expectEmit(true, false, false, true, address(box));
             emit DeliveryFailed(purchase);
-            // This is below the fixed ceiling plus all caller work: the gas reserve must also hold.
-            box.open{gas: 1_200_000}(purchase, header);
+            // OpenGas.t.sol checks the reserve at the exact gas boundary; this checks the receiver cannot veto.
+            box.open(purchase, header);
             (,,,, bool opened) = box.purchases(purchase);
             assertTrue(opened);
             assertFalse(box.delivered(purchase));
