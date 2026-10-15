@@ -44,20 +44,49 @@ contract DeliveryEdgesTest is BoxTestBase {
 
     // ----------------------------------------------------------------- gas-starved open
 
-    /// @dev A caller who forwards too little gas for the mint cannot make `open` revert because of
-    ///      delivery, cannot change the roll, and cannot stop anyone from delivering later.
-    function test_GasStarvedOpenOfHonestBuyerStoresRollAndAnyoneDeliversLater() public {
+    /// @dev A stranger who forwards too little gas for the mint can neither park an honest buyer's roll on
+    ///      the stored path nor change it: the open reverts untouched, and a later full-gas open delivers
+    ///      exactly the roll previewed before the starved attempt. The same precondition applies when the
+    ///      box is not a minter: a short caller sees InsufficientGas, never DeliveryFailed, so a stored roll
+    ///      is always one that received the full mint budget.
+    function test_GasStarvedOpenRevertsUntouchedAndNeverParksAnHonestRoll() public {
         uint256 purchase = buy(10);
         bytes32 randao = keccak256("gas starved");
         bytes memory header = ready(purchase, randao);
         uint256[] memory expected = box.previewOpen(purchase, randao);
+
+        vm.prank(stranger);
+        (bool ok, bytes memory data) = address(box).call{gas: 600_000}(abi.encodeCall(box.open, (purchase, header)));
+        assertFalse(ok, "a starved open must not succeed");
+        assertEq(bytes4(data), OGClubBox.InsufficientGas.selector);
+        (,,,, bool opened) = box.purchases(purchase);
+        assertFalse(opened, "a starved open left the purchase opened");
+        assertFalse(box.delivered(purchase));
+        assertEq(box.getStoredItems(purchase).length, 0, "a starved open stored a roll");
+        assertEq(furniture.totalSupply(), 0);
+        for (uint256 id = 1; id <= 3; ++id) {
+            assertEq(box.minted(seasonId, id), 0, "a starved open reserved caps");
+        }
+        assertEq(box.previewOpen(purchase, randao), expected, "the starved attempt changed the roll");
+
+        // With the box revoked the mint would fail at once, but a short caller still may not reach it.
+        furniture.revokeMinter(address(box));
+        vm.prank(stranger);
+        (ok, data) = address(box).call{gas: 600_000}(abi.encodeCall(box.open, (purchase, header)));
+        assertFalse(ok);
+        assertEq(bytes4(data), OGClubBox.InsufficientGas.selector);
+        (,,,, opened) = box.purchases(purchase);
+        assertFalse(opened);
+        assertEq(box.getStoredItems(purchase).length, 0);
+
+        // Full gas: the honest roll is recorded on the failure path, caps reserved, nothing minted.
         vm.recordLogs();
         vm.expectEmit(true, false, false, true, address(box));
         emit DeliveryFailed(purchase);
         vm.prank(stranger);
-        box.open{gas: 600_000}(purchase, header);
+        box.open(purchase, header);
         checkOpenLogs(purchase, expected, randao, false);
-        (,,,, bool opened) = box.purchases(purchase);
+        (,,,, opened) = box.purchases(purchase);
         assertTrue(opened);
         assertFalse(box.delivered(purchase));
         assertEq(box.getStoredItems(purchase), expected);
@@ -67,6 +96,9 @@ contract DeliveryEdgesTest is BoxTestBase {
         }
         vm.expectRevert(abi.encodeWithSelector(OGClubBox.AlreadyOpened.selector, purchase));
         box.open(purchase, header);
+
+        // Nothing minted yet, so the box is re-authorized at once; anyone delivers exactly the stored roll.
+        furniture.grantMinter(address(box));
         vm.expectEmit(true, true, false, true, address(box));
         emit Delivered(purchase, buyer);
         vm.prank(stranger);
@@ -80,16 +112,18 @@ contract DeliveryEdgesTest is BoxTestBase {
         assertEq(furniture.totalSupply(), 10);
     }
 
-    /// @dev Whatever gas `open` receives, it either reverts atomically or records the preview roll;
-    ///      it never lands in a state where the roll is lost or the caps disagree with the record.
+    /// @dev Whatever gas `open` receives for a healthy EOA buyer, it either reverts atomically (out of gas or
+    ///      the explicit InsufficientGas precondition, never a lost roll or a half-reserved cap) or delivers in
+    ///      full. An honest buyer can never be parked on the stored path by the caller's gas choice.
     /// forge-config: default.fuzz.runs = 200
-    function testFuzz_OpenWithAnyGasIsAtomicOrRecordsThePreview(uint32 gas, uint8 count, bytes32 randao) public {
+    function testFuzz_OpenWithAnyGasIsAtomicOrDeliversThePreview(uint32 gas, uint8 count, bytes32 randao) public {
         count = uint8(bound(count, 1, 10));
         gas = uint32(bound(gas, 150_000, 1_500_000));
         uint256 purchase = buy(count);
         bytes memory header = ready(purchase, randao);
         uint256[] memory expected = box.previewOpen(purchase, randao);
-        (bool ok,) = address(box).call{gas: gas}(abi.encodeCall(box.open, (purchase, header)));
+        vm.prank(stranger);
+        (bool ok, bytes memory data) = address(box).call{gas: gas}(abi.encodeCall(box.open, (purchase, header)));
         (,,,, bool opened) = box.purchases(purchase);
         assertEq(opened, ok, "open is atomic");
         uint256 total;
@@ -100,24 +134,34 @@ contract DeliveryEdgesTest is BoxTestBase {
         }
         assertEq(total, ok ? count : 0);
         if (!ok) {
+            // Either a plain out-of-gas (no data) or the explicit precondition naming the published budget.
+            if (data.length != 0) {
+                assertEq(bytes4(data), OGClubBox.InsufficientGas.selector);
+                assertEq(data.length, 4 + 64);
+                (uint256 required, uint256 available) = abi.decode(_tail(data), (uint256, uint256));
+                assertEq(required, box.OPEN_DELIVERY_GAS());
+                assertLt(available, required);
+            }
             assertEq(box.getStoredItems(purchase).length, 0);
             assertFalse(box.delivered(purchase));
             assertEq(furniture.totalSupply(), 0);
-            return;
+            assertEq(box.previewOpen(purchase, randao), expected, "a failed attempt changed the roll");
+            // The purchase is still openable afterwards with ordinary gas.
+            box.open(purchase, header);
         }
-        if (box.delivered(purchase)) {
-            assertEq(box.getStoredItems(purchase).length, 0);
-            assertEq(furniture.totalSupply(), count);
-        } else {
-            assertEq(box.getStoredItems(purchase), expected);
-            assertEq(furniture.totalSupply(), 0);
-            vm.prank(stranger);
-            box.deliver(purchase);
-            assertTrue(box.delivered(purchase));
-            assertEq(furniture.totalSupply(), count);
-        }
+        assertTrue(box.delivered(purchase), "a healthy buyer must be delivered at open");
+        assertEq(box.getStoredItems(purchase).length, 0);
+        assertEq(furniture.totalSupply(), count);
         for (uint256 id = 1; id <= 3; ++id) {
             assertEq(furniture.balanceOf(buyer, id), countOf(expected, id));
+            assertEq(box.minted(seasonId, id), countOf(expected, id));
+        }
+    }
+
+    function _tail(bytes memory data) internal pure returns (bytes memory out) {
+        out = new bytes(data.length - 4);
+        for (uint256 i; i < out.length; ++i) {
+            out[i] = data[i + 4];
         }
     }
 
